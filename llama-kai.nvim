@@ -1,0 +1,119 @@
+
+local M = {}
+
+M.disp_buf = nil
+M.win = nil
+local output_file = "/tmp/llmcodechat_output.txt"
+
+local function ensure_display_window()
+  if not M.disp_buf or not vim.api.nvim_buf_is_valid(M.disp_buf) or not M.win or not vim.api.nvim_win_is_valid(M.win) then
+    M.disp_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(M.disp_buf, "filetype", "markdown")
+    vim.api.nvim_buf_set_option(M.disp_buf, "syntax", "off")
+
+    local width = math.floor(vim.o.columns * 0.4)
+    local height = math.min(15, math.floor(vim.o.lines * 0.3))
+    local row = vim.o.lines - height - 11
+    local col = vim.o.columns - width - 1
+
+    local opts = {
+      relative = "editor",
+      width = width,
+      height = height,
+      row = row,
+      col = col,
+      style = "minimal",
+      border = "single",
+      title = "KAI"
+    }
+
+    M.win = vim.api.nvim_open_win(M.disp_buf, false, opts)
+    vim.api.nvim_buf_set_keymap(M.disp_buf, "n", "q", "<Cmd>close<CR>", {noremap = true, silent = true})
+    vim.api.nvim_buf_set_keymap(M.disp_buf, "n", "<leader>y", "ggyG", {noremap = true, silent = true})
+  end
+end
+
+local function append_to_display(text)
+  ensure_display_window()
+  local current_lines = vim.api.nvim_buf_get_lines(M.disp_buf, 0, -1, false)
+  local new_lines = vim.split(text, "\n", {plain = true, trimempty = true})
+  vim.api.nvim_buf_set_lines(M.disp_buf, -1, -1, false, new_lines)
+  if M.win and vim.api.nvim_win_is_valid(M.win) then
+    vim.api.nvim_win_set_cursor(M.win, {#current_lines + #new_lines, 0})
+  end
+end
+
+function M.process_kai_comment()
+  local line = vim.api.nvim_get_current_line()
+  local comment_text = line:match("^%s*//%s*KAI%s+(.+)$")
+  if not comment_text then
+    return
+  end
+  -- !WARNING: This assumes 1. use f zsh 2. a `llmcodechat` function in `.zshrc` as a wrapper for calls to `llama-cli`
+  local cmd = {
+    "zsh",
+    "-c",
+    "source ~/.zshrc; llmcodechat " .. vim.fn.shellescape(comment_text) .. " > " .. output_file
+  }
+  vim.api.nvim_echo({{"Executing: " .. table.concat(cmd, " "), "Normal"}}, true, {})
+
+  local job_id = vim.fn.jobstart(cmd, {
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code == 0 then
+
+          -- Read output
+          local file = io.open(output_file, "r")
+          if file then
+            local full_output = file:read("*all")
+            file:close()
+            full_output = full_output:gsub("\r\n?", "\n")
+            local last_pos = full_output:find(comment_text:gsub("%p", "%%%0"), nil, true)
+            local trimmed_output = full_output
+            if last_pos then
+              last_pos = last_pos + #comment_text - 1
+              trimmed_output = full_output:sub(last_pos + 1):match("^%s*(.-)%s*$") or ""
+            end
+            if trimmed_output ~= "" then
+              append_to_display(trimmed_output)
+            else
+              vim.api.nvim_err_writeln("No output after last '" .. comment_text .. "'")
+            end
+          else
+            vim.api.nvim_err_writeln("Failed to read output file: " .. output_file)
+          end
+        else
+          vim.api.nvim_err_writeln("llmcodechat exited with code " .. code)
+        end
+      end)
+    end,
+  })
+
+  if job_id <= 0 then
+    vim.api.nvim_err_writeln("Failed to start job: " .. table.concat(cmd, " "))
+  else
+    vim.api.nvim_echo({{"Requested llmcodechat: " .. comment_text, "Normal"}}, false, {})
+  end
+end
+
+-- Cleanup
+vim.api.nvim_create_autocmd("VimLeave", {
+  callback = function()
+    if M.win and vim.api.nvim_win_is_valid(M.win) then
+      vim.api.nvim_win_close(M.win, true)
+    end
+
+    os.remove(output_file)
+  end,
+})
+
+vim.api.nvim_create_autocmd({"BufEnter", "BufNewFile"}, {
+  pattern = {"*.cpp", "*.hpp", "*.c", "*.h"},
+  callback = function()
+    vim.api.nvim_buf_set_keymap(0, "n", "<leader>k", ":lua require('kai-comment').process_kai_comment()<CR>", 
+      {noremap = true, silent = true})
+  end,
+})
+
+return M
+
